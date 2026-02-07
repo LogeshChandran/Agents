@@ -3,12 +3,11 @@ import logging
 import numpy as np
 import requests
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, SecretStr
-from qdrant_client import QdrantClient
-from qdrant_client.models import models
-from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding
+import chromadb
+from chromadb.api.models.Collection import Collection
 from langchain_openai import ChatOpenAI
 import tiktoken
 
@@ -29,18 +28,19 @@ logger = logging.getLogger("RAG_Chat_API")
 
 # Configuration
 FAST_API_ENDPOINT = os.getenv("FAST_API_ENDPOINT", "http://107.99.236.204:8080")
-QDRANT_URL = os.getenv("QDRANT_URL", "http://107.99.236.204:6333")
+CHROMA_DEPLOYMENT = os.getenv("CHROMA_DEPLOYMENT", "local").lower()
+CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "document_collection")
-QWEN_8B_DIM = int(os.getenv("QWEN_8B_DIM", "4096"))
-COLBERT_DIM = int(os.getenv("COLBERT_DIM", "128"))
 
-# Initialize Qdrant client
-logger.info(f"Initializing Qdrant client with URL: {QDRANT_URL}")
-# qdrant_client = QdrantClient(url=QDRANT_URL)
-qdrant_client = QdrantClient(
-    url="https://b530e725-bc4f-4ef3-95ab-73c88ade46a8.us-east4-0.gcp.cloud.qdrant.io:6333", 
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.7VGDcOF_Menx6oR1lkYl163oryzlZxzoghGDEnLLkCo",
-)
+# Initialize Chroma client (local by default, optional remote HTTP mode)
+if CHROMA_DEPLOYMENT == "http":
+    logger.info(f"Initializing Chroma HTTP client with host={CHROMA_HOST}, port={CHROMA_PORT}")
+    chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+else:
+    logger.info(f"Initializing Chroma local persistent client with path={CHROMA_PERSIST_DIR}")
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 
 # Pydantic models for request/response
 class ChatRequest(BaseModel):
@@ -98,17 +98,14 @@ class CustomEmbedding:
 
 # Hybrid retriever class
 class HybridRetriever:
-    def __init__(self, qdrant_client: QdrantClient, collection_name: str):
-        self.qdrant = qdrant_client
+    def __init__(self, chroma_client, collection_name: str):
+        self.chroma = chroma_client
         self.collection_name = collection_name
+        self.collection: Collection = self.chroma.get_or_create_collection(name=collection_name)
         # Initialize embedding models for querying
         try:
-            print()
             self.dense_embedding_model = CustomEmbedding()
             logger.info("loaded dense")
-            self.bm25_embedding_model = SparseTextEmbedding(model_name="Qdrant/bm25",cache_dir=os.getenv("BM25_CACHE_DIR", "change"),_local_files_only=True)
-            logger.info("loaded embedding bm25")
-            self.late_interaction_embedding_model = LateInteractionTextEmbedding(model_name="colbert-ir/colbertv2.0",cache_dir=os.getenv("COLBERT_CACHE_DIR", "colbert"),_local_files_only=True)
             logger.info("Query models initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing query models: {str(e)}")
@@ -116,53 +113,35 @@ class HybridRetriever:
         logger.info(f"HybridRetriever initialized for collection: {collection_name}")
         
     def retrieve(self, query: str, top_k: int = 10) -> List[Dict]:
-        from qdrant_client.models import models
         logger.info(f"Retrieving documents for query: {query[:50]}... (top_k={top_k})")
         try:
-            # Generate all query embeddings
+            # Generate dense query embedding
             logger.info("Generating query embeddings")
             dense_vectors = self.dense_embedding_model.embed_query(query)
-            sparse_vectors = list(self.bm25_embedding_model.query_embed(query))[0]
-            late_vectors = list(self.late_interaction_embedding_model.query_embed(query))[0]
             
-            # Perform hybrid search with prefetch for dense and sparse embeddings
-            logger.info("Performing hybrid search with prefetch")
-            prefetch = [
-                models.Prefetch(
-                    query=dense_vectors,
-                    using="qwen3-embedding:0.6b",
-                    limit=20,
-                ),
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=sparse_vectors.indices.tolist(),
-                        values=sparse_vectors.values.tolist()
-                    ),
-                    using="bm25",
-                    limit=20,
-                ),
-            ]
-            
-            # Rerank with late interaction embeddings (ColBERT)
-            logger.info("Reranking with ColBERT late interaction embeddings")
-            search_result = self.qdrant.query_points(
-                collection_name=self.collection_name,
-                prefetch=prefetch,
-                query=late_vectors,
-                using="colbertv2.0",
-                with_payload=True,
-                limit=top_k
+            # Search Chroma using the query embedding
+            logger.info("Performing Chroma vector search")
+            search_result = self.collection.query(
+                query_embeddings=[dense_vectors],
+                n_results=top_k,
+                include=["metadatas", "documents", "distances"]
             )
             
             results = []
-            if search_result and search_result.points:
-                for result in search_result.points:
+            if search_result and search_result.get("ids"):
+                ids = search_result.get("ids", [[]])[0]
+                metadatas = search_result.get("metadatas", [[]])[0]
+                documents = search_result.get("documents", [[]])[0]
+                distances = search_result.get("distances", [[]])[0]
+                for idx, result_id in enumerate(ids):
+                    metadata = metadatas[idx] if idx < len(metadatas) and metadatas[idx] else {}
+                    distance = distances[idx] if idx < len(distances) else 0.0
                     results.append({
-                        "id": result.id,
-                        "text": result.payload.get("text", "") if result.payload else "",
-                        "source": result.payload.get("source", "") if result.payload else "",
-                        "file_name": result.payload.get("file_name", "") if result.payload else "",
-                        "score": result.score
+                        "id": result_id,
+                        "text": documents[idx] if idx < len(documents) else "",
+                        "source": metadata.get("source", "") if metadata else "",
+                        "file_name": metadata.get("file_name", "") if metadata else "",
+                        "score": 1 - float(distance),
                     })
             
             logger.info(f"Retrieval complete. Returning top {min(top_k, len(results))} results")
@@ -304,7 +283,7 @@ Remember: Your credibility depends on strict adherence to these rules. When in d
 
 # Initialize components
 logger.info("Initializing RAG components")
-retriever = HybridRetriever(qdrant_client, COLLECTION_NAME)
+retriever = HybridRetriever(chroma_client, COLLECTION_NAME)
 generator = RAGGenerator()
 logger.info("RAG components initialized")
 
@@ -364,5 +343,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT_RAG_SYSTEM", "8001"))
     uvicorn.run("rag:app", host="0.0.0.0", port=port)
-
 
